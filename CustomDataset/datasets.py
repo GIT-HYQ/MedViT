@@ -55,6 +55,8 @@ class INatDataset(ImageFolder):
 def build_dataset(is_train, args):
     transform = build_transform(is_train, args)
 
+    print("+++++++", args.data_path)
+
     if args.data_set == 'CIFAR':
         dataset = datasets.CIFAR100(args.data_path, train=is_train, transform=transform, download=True)
         nb_classes = 100
@@ -78,10 +80,19 @@ def build_dataset(is_train, args):
                               category=args.inat_category, transform=transform)
         nb_classes = dataset.nb_classes
     elif args.data_set == "image_folder":
-        root = args.data_path if is_train else args.eval_data_path
+        # root = args.data_path if is_train else args.eval_data_path
+        # dataset = datasets.ImageFolder(root, transform=transform)
+        root = os.path.join(args.data_path, 'train' if is_train else 'val')
         dataset = datasets.ImageFolder(root, transform=transform)
-        nb_classes = args.nb_classes
-        assert len(dataset.class_to_idx) == nb_classes
+        # 直接从数据集获取类别数，不依赖外部配置
+        nb_classes = len(dataset.class_to_idx)
+        
+        # 可选：如果配置了 args.nb_classes，进行验证
+        if hasattr(args, 'nb_classes') and args.nb_classes:
+            assert nb_classes == args.nb_classes, \
+                f"数据集类别数 ({nb_classes}) 与配置 ({args.nb_classes}) 不一致"
+        
+        print(f"自动检测类别数：{nb_classes}, 类别：{dataset.classes}")
     else:
         raise NotImplementedError()
     print("Number of the class = %d" % nb_classes)
