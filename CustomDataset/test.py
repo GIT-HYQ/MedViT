@@ -12,10 +12,16 @@ import torch.backends.cudnn as cudnn
 import json
 import os
 from pathlib import Path
-from collections import defaultdict
+from collections import Counter
 from timm.models import create_model
 import MedViT
+import csv
 
+def parse_class_names(raw: str):
+    if not raw:
+        return None
+    names = [x.strip() for x in raw.split(",") if x.strip()]
+    return names if names else None
 
 def get_args_parser():
     parser = argparse.ArgumentParser('MedViT testing script', add_help=False)
@@ -33,6 +39,8 @@ def get_args_parser():
     parser.add_argument('--nb_classes', default=2, type=int, help='number of classes')
     parser.add_argument('--has-labels', action='store_true', default=None,
                         help='whether test set has labels (auto-detect if not specified)')
+    parser.add_argument('--no-labels', action='store_false', dest='has_labels',
+                        help='force test set as unlabeled')
     
     # Test parameters
     parser.add_argument('--checkpoint', default='', type=str, required=True,
@@ -48,9 +56,16 @@ def get_args_parser():
     parser.add_argument('--pin-mem', action='store_true', default=True)
     
     # Output options
-    parser.add_argument('--save_pred', action='store_true', help='save predictions to file')
-    parser.add_argument('--save_confusion', action='store_true', help='save confusion matrix')
-    parser.add_argument('--verbose', action='store_true', help='print detailed results')
+    parser.add_argument('--save-pred', action='store_true', help='save predictions to file')
+    parser.add_argument('--save-confusion', action='store_true', help='save confusion matrix')
+    # parser.add_argument('--verbose', action='store_true', help='print detailed results')
+    
+    parser.add_argument(
+        '--class-names',
+        default='lca,rca',
+        type=str,
+        help='comma-separated class names, e.g. "lca,rca"'
+    )
     
     return parser
 
@@ -130,7 +145,7 @@ def build_test_dataset(args):
     return dataset
 
 
-def calculate_metrics(predictions, targets, num_classes):
+def calculate_metrics(predictions, targets, num_classes, probabilities=None):
     """
     计算完整的分类指标
     """
@@ -138,51 +153,47 @@ def calculate_metrics(predictions, targets, num_classes):
         accuracy_score, precision_score, recall_score, f1_score,
         confusion_matrix, roc_auc_score
     )
-    import numpy as np
-    
     predictions = np.array(predictions)
     targets = np.array(targets)
-    
+
     metrics = {}
-    
-    # 1. Accuracy
     metrics['accuracy'] = float(accuracy_score(targets, predictions))
     metrics['acc1'] = metrics['accuracy'] * 100
-    
-    # 2. Precision, Recall, F1-Score (per class & macro/weighted)
+
     precision_per_class = precision_score(targets, predictions, average=None, labels=range(num_classes), zero_division=0)
     recall_per_class = recall_score(targets, predictions, average=None, labels=range(num_classes), zero_division=0)
     f1_per_class = f1_score(targets, predictions, average=None, labels=range(num_classes), zero_division=0)
-    
+
     metrics['precision_macro'] = float(precision_score(targets, predictions, average='macro', labels=range(num_classes), zero_division=0)) * 100
     metrics['precision_weighted'] = float(precision_score(targets, predictions, average='weighted', labels=range(num_classes), zero_division=0)) * 100
     metrics['recall_macro'] = float(recall_score(targets, predictions, average='macro', labels=range(num_classes), zero_division=0)) * 100
     metrics['recall_weighted'] = float(recall_score(targets, predictions, average='weighted', labels=range(num_classes), zero_division=0)) * 100
     metrics['f1_macro'] = float(f1_score(targets, predictions, average='macro', labels=range(num_classes), zero_division=0)) * 100
     metrics['f1_weighted'] = float(f1_score(targets, predictions, average='weighted', labels=range(num_classes), zero_division=0)) * 100
-    
-    # Per-class metrics
-    metrics['per_class'] = {}
-    for i in range(num_classes):
-        metrics['per_class'][i] = {
+
+    metrics['per_class'] = {
+        i: {
             'precision': float(precision_per_class[i]) * 100,
             'recall': float(recall_per_class[i]) * 100,
             'f1': float(f1_per_class[i]) * 100
-        }
-    
-    # 3. Confusion Matrix
+        } for i in range(num_classes)
+    }
+
     cm = confusion_matrix(targets, predictions, labels=range(num_classes))
     metrics['confusion_matrix'] = cm.tolist()
-    
-    # 4. AUC-ROC
+
     try:
-        if num_classes == 2:
-            metrics['auc_roc'] = float(roc_auc_score(targets, predictions)) * 100
+        if probabilities is not None:
+            probabilities = np.array(probabilities)
+            if num_classes == 2:
+                metrics['auc_roc'] = float(roc_auc_score(targets, probabilities[:, 1])) * 100
+            else:
+                metrics['auc_roc'] = float(roc_auc_score(targets, probabilities, average='macro', multi_class='ovr')) * 100
         else:
-            metrics['auc_roc'] = float(roc_auc_score(targets, predictions, average='macro', multi_class='ovr')) * 100
-    except:
+            metrics['auc_roc'] = None
+    except Exception:
         metrics['auc_roc'] = None
-    
+
     return metrics
 
 
@@ -204,6 +215,16 @@ def main(args):
     print(f"Test samples: {len(dataset_test)}")
     print(f"Number of classes: {args.nb_classes}")
     print(f"Has labels: {dataset_test.has_labels}")
+
+    # 1) 统一类别名（优先 --class-names）
+    class_names = dataset_test.classes if getattr(dataset_test, "classes", None) else [str(i) for i in range(args.nb_classes)]
+    user_names = parse_class_names(args.class_names)
+    if user_names is not None:
+        if len(user_names) != args.nb_classes:
+            raise ValueError(f'--class-names数量({len(user_names)}) != nb_classes({args.nb_classes})')
+        class_names = user_names
+
+    print(f"Class names: {class_names}")
 
     # 数据加载器
     data_loader_test = torch.utils.data.DataLoader(
@@ -259,29 +280,41 @@ def main(args):
     print("\n" + "-"*60)
     print("Running inference...")
     
-    all_preds = []
-    all_targets = []
-    all_probs = []
-    all_paths = []
-    
+    all_preds, all_paths = [], []
+    all_targets = [] if dataset_test.has_labels else None
+    need_probs = dataset_test.has_labels or args.save_pred
+    all_probs = [] if need_probs else None
+
     with torch.no_grad():
         for images, targets, paths in data_loader_test:
             images = images.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
-            
             outputs = model(images)
             probs = torch.softmax(outputs, dim=1)
             preds = outputs.argmax(dim=1)
-            
+
             all_preds.append(preds.cpu())
-            all_targets.append(targets.cpu())
-            all_probs.append(probs.cpu())
+            if dataset_test.has_labels:
+                all_targets.append(targets.cpu())
+            if need_probs:
+                all_probs.append(probs.cpu())
             all_paths.extend(paths)
-    
+
     all_preds = torch.cat(all_preds, dim=0)
-    all_targets = torch.cat(all_targets, dim=0)
-    all_probs = torch.cat(all_probs, dim=0)
-    
+    pred_ids = all_preds.tolist()
+    pred_names = [class_names[i] for i in pred_ids]
+
+    if dataset_test.has_labels:
+        all_targets = torch.cat(all_targets, dim=0)
+        target_ids = all_targets.tolist()
+        target_names = [class_names[i] for i in target_ids]
+    else:
+        all_targets = None
+
+    if need_probs:
+        all_probs = torch.cat(all_probs, dim=0)
+    else:
+        all_probs = None
+
     # 计算指标
     results = {
         'checkpoint': args.checkpoint,
@@ -298,11 +331,16 @@ def main(args):
         print("="*60)
         
         metrics = calculate_metrics(
-            all_preds.numpy().tolist(),
-            all_targets.numpy().tolist(),
-            args.nb_classes
+            pred_ids,
+            target_ids,
+            args.nb_classes,
+            probabilities=all_probs.numpy() if all_probs is not None else None
         )
-        
+        metrics["per_class_named"] = {
+            class_names[i]: metrics["per_class"][i] for i in range(args.nb_classes)
+        }
+        results["metrics"] = metrics
+
         # 打印指标
         print(f"\n📊 Accuracy@1:        {metrics['acc1']:.2f}%")
         if metrics['auc_roc']:
@@ -363,12 +401,27 @@ def main(args):
         # 保存预测结果
         if args.save_pred:
             pred_file = output_dir / 'predictions.csv'
-            with open(pred_file, 'w') as f:
-                f.write("path,pred,prob\n")
+            with open(pred_file, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                header = ["path", "pred", "pred_name", "prob"]
+                if dataset_test.has_labels:
+                    header.extend(["target", "target_name", "correct"])
+                writer.writerow(header)
+
                 for i, path in enumerate(all_paths):
-                    pred = all_preds[i].item()
-                    prob = all_probs[i].max().item()
-                    f.write(f"{path},{pred},{prob:.4f}\n")
+                    pred = int(all_preds[i].item())
+                    pred_name = class_names[pred]
+                    prob = float(all_probs[i, pred].item()) if all_probs is not None else ""
+
+                    row = [path, pred, pred_name, prob]
+
+                    if dataset_test.has_labels:
+                        target = int(all_targets[i].item())
+                        target_name = class_names[target]
+                        correct = int(pred == target)
+                        row.extend([target, target_name, correct])
+
+                    writer.writerow(row)
             print(f"💾 Predictions saved to: {pred_file}")
         
         # 保存详细报告
