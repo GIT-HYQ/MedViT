@@ -462,7 +462,7 @@ if __name__ == '__main__':
 
 
     """
-    python test.py --checkpoint ../medvit_cls_exp/0311_162826/checkpoint_best.pth --data-path /home/share/clr/share/data/cag_cls --test-dir test --output-dir ./test_results --save_pred --save_confusion --has-labels
+    python test.py --checkpoint ../medvit_cls_exp/0311_162826/checkpoint_best.pth --data-path /home/share/clr/share/data/cag_cls --test-dir test --output-dir ./test_results --save-pred --save-confusion --has-labels
     # 1. 有标签测试集（自动检测）
     python test.py \
         --checkpoint ../medvit_cls_exp/0311_162826/checkpoint_best.pth \
